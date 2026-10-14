@@ -22,11 +22,15 @@ import java.util.concurrent.Executors;
  *
  * <h2>接口</h2>
  * <pre>
- * GET  /health              存活探针
+ * GET  /health              存活探针 + 测量版本（引擎、函数白名单哈希、语义取舍），见 {@link Measure#health}
  * GET  /functions           自定义函数白名单（闭集，与 fields.json 对齐）
  * POST /execute             单条 QL
  * POST /execute/batch       一份报文 × 多条 QL（640 条规则跑一单的主路径）
+ * POST /compile             只解析不求值：{ql} 或 {rules:[{key,ql}]}
  * </pre>
+ *
+ * <p>每条结果带 {@code errorCode}（闭集，见 {@link Measure#errorCode}）；单条规则的内部异常记为
+ * {@code INTERNAL}，不影响同批其他规则；请求不合法返回 400 与 {@code BAD_REQUEST}。
  */
 public final class Server {
 
@@ -43,6 +47,7 @@ public final class Server {
         server.createContext("/health", Server::health);
         server.createContext("/functions", Server::functions);
         server.createContext("/execute", Server::execute);
+        server.createContext("/compile", Server::compile);
         server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
         server.start();
         System.out.println("qlengine listening on " + host + ":" + port + " engine=" + ENGINE);
@@ -51,7 +56,7 @@ public final class Server {
     // ------------------------------------------------------------ 路由
 
     private static void health(HttpExchange ex) throws IOException {
-        send(ex, 200, Map.of("ok", true, "engine", ENGINE));
+        send(ex, 200, Measure.health());
     }
 
     private static void functions(HttpExchange ex) throws IOException {
@@ -68,7 +73,51 @@ public final class Server {
             boolean batch = ex.getRequestURI().getPath().endsWith("/batch");
             send(ex, 200, batch ? runBatch(req) : runOne(req));
         } catch (Exception e) {
-            send(ex, 400, Map.of("error", e.getClass().getSimpleName() + ": " + e.getMessage()));
+            send(ex, 400, badRequest(e));
+        }
+    }
+
+    private static void compile(HttpExchange ex) throws IOException {
+        if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
+            send(ex, 405, Map.of("error", "POST only", "errorCode", "BAD_REQUEST"));
+            return;
+        }
+        try {
+            JsonNode req = Json.M.readTree(ex.getRequestBody().readAllBytes());
+            if (req.has("rules")) {
+                List<Map.Entry<String, String>> rules = new ArrayList<>();
+                for (JsonNode item : req.path("rules")) {
+                    rules.add(Map.entry(item.path("key").asText(""), item.path("ql").asText("")));
+                }
+                send(ex, 200, Map.of("engine", ENGINE, "measurementVersion", Measure.measurementVersion(),
+                        "results", Measure.compileAll(rules)));
+            } else {
+                Map<String, Object> out = new LinkedHashMap<>(Measure.compile(req.path("ql").asText("")));
+                out.put("engine", ENGINE);
+                send(ex, 200, out);
+            }
+        } catch (Exception e) {
+            send(ex, 400, badRequest(e));
+        }
+    }
+
+    private static Map<String, Object> badRequest(Exception e) {
+        return Map.of("error", e.getClass().getSimpleName() + ": " + e.getMessage(), "errorCode", "BAD_REQUEST");
+    }
+
+    /** 三值判定写进结果；errorCode 用 put 而非 Map.of，因为它可以为 null。 */
+    private static void putVerdict(Map<String, Object> r, String ql, Fields.Env env) {
+        try {
+            Ql.Verdict v = Ql.run(ql, env);
+            r.put("verdict", v.verdict());
+            r.put("missing", v.missing());
+            r.put("error", v.error());
+            r.put("errorCode", Measure.errorCode(v));
+        } catch (RuntimeException e) {
+            r.put("verdict", null);
+            r.put("missing", List.of());
+            r.put("error", "internal: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            r.put("errorCode", "INTERNAL");
         }
     }
 
@@ -96,10 +145,7 @@ public final class Server {
         out.put("engine", ENGINE);
 
         if (!mode.equals("native")) {
-            Ql.Verdict v = Ql.run(ql, env);
-            out.put("verdict", v.verdict());
-            out.put("missing", v.missing());
-            out.put("error", v.error());
+            putVerdict(out, ql, env);
         }
         if (!mode.equals("3vl")) {
             out.put("native", Native.run(ql, env));
@@ -126,17 +172,14 @@ public final class Server {
             Map<String, Object> r = new LinkedHashMap<>();
             r.put("key", key);
             if (!mode.equals("native")) {
-                Ql.Verdict v = Ql.run(ql, env);
-                r.put("verdict", v.verdict());
-                r.put("missing", v.missing());
-                r.put("error", v.error());
+                putVerdict(r, ql, env);
             }
             if (!mode.equals("3vl")) {
                 r.put("native", Native.run(ql, env));
             }
             results.add(r);
         }
-        return Map.of("engine", ENGINE, "results", results);
+        return Map.of("engine", ENGINE, "measurementVersion", Measure.measurementVersion(), "results", results);
     }
 
     // ------------------------------------------------------------ IO
