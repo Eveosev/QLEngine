@@ -75,7 +75,7 @@
 | 文件 | 职责 |
 |---|---|
 | `Server.java` | 路由、请求解析、批量执行。批量时每条规则用独立的 Env，missing 集合不串台；单条规则内部异常记为 `INTERNAL`，不影响同批其他规则 |
-| `Ql.java` | 三值求值器。文法只覆盖「或 / 与 / 比较 / 加减乘除 / 一元 / 原子」六层，因为统计 640 条生成的 QL，三元、赋值、语句分隔、`in`、成员访问都是 0 次。它是 Python 求值器 `qlrun.py`（RuleCraft 仓）的语义孪生，两者逐条对拍一致 |
+| `Ql.java` | 三值求值器。文法覆盖「三元 / 或 / 与 / 比较 / 加减乘除 / 一元 / 原子」；不支持赋值、语句分隔、`in`、成员访问 `a.b`（报 `PARSE`）。它是 Python 求值器 `qlrun.py`（RuleCraft 仓）的语义孪生，两者逐条对拍一致 |
 | `Native.java` | QLExpress4 路径（见上节）。`countWhere` 的行内表达式交回 QLExpress 在行上下文里再跑一遍，行上下文与 3vl 同源 |
 | `Fn.java` | 17 个白名单函数的实现，两条路径共用 |
 | `Registry.java` | 函数白名单（规范名 + 别名）。与 RuleCraft 字段库 `fields.json` 的 functions 段一一对应，加函数时两处一起改 |
@@ -154,24 +154,53 @@ QLENGINE_RULE_DIRS=<规则包目录>[:<规则包目录>…] QLENGINE_PAYLOADS=<�
 
 ## 部署
 
-`deploy/deploy.sh` 把服务部署到一台 Linux 主机，用 systemd 管理。
+`deploy/deploy.sh` 把服务部署到一台 Linux 主机：服务由 systemd 管理，只监听 `127.0.0.1:7870`（服务**没有鉴权**）；对外经 nginx 加 TLS 与 BasicAuth。
 
-- 远端只监听 `127.0.0.1:7870`，因为服务**没有鉴权**；本机经 SSH 隧道访问。
-- 不依赖系统 Java：从清华镜像下载 Temurin JRE 21 到 `/opt/qlengine/jre-*`，按 Adoptium 官方 sha256 校验。
-- JVM 参数为 `-Xmx128m`、SerialGC、C1，systemd `MemoryMax=256M`。实测：10 张单全量度量，峰值 RSS 约 49MB。
-- 每个 release 放在 `/opt/qlengine/releases/<commit>/`，`current` / `previous` 两个软链用于回滚。
-- 部署后核对远端 `/health` 的测量版本与本机构建一致，不一致自动回滚。
+两部分分开管理：发版只换 jar，入口只在改入口时动。
+
+| 部分 | 命令 | 改动范围 |
+|---|---|---|
+| 发版 | `install`、`rollback [commit]`、`releases`、`status` | `/opt/qlengine/releases/<commit>/`、`current` / `previous` 软链、`/etc/systemd/system/qlengine.service`、`deploy.log` |
+| 入口 | `proxy`、`proxy-user <name>`、`cert` | `/etc/nginx/conf.d/qlengine.conf`、`/etc/nginx/qlengine/`（证书）、`/etc/nginx/.htpasswd-qlengine`、`/etc/fail2ban/jail.d/qlengine.conf` |
+
+### 发一个新版本
 
 ```bash
-QLENGINE_REMOTE=<ssh 主机名> deploy/deploy.sh preflight   # 只读检查
-QLENGINE_REMOTE=<ssh 主机名> deploy/deploy.sh install
-QLENGINE_REMOTE=<ssh 主机名> deploy/deploy.sh status | rollback
-LOCAL_PORT=17870 deploy/deploy.sh tunnel                  # 本机 127.0.0.1:17870 → 远端 127.0.0.1:7870
+git push origin integrate                 # install 只部署已推到 origin 的提交
+deploy/deploy.sh install                  # 构建（含测试）→ 推 jar → 切换 → 重启 → 核对测量版本 → 冒烟 → 记日志
+deploy/deploy.sh releases                 # release 列表与部署日志
+deploy/deploy.sh rollback                 # 回到上一个；rollback <commit> 回到指定 release
 ```
+
+`install` 的保护：
+
+- **工作区必须干净，提交必须已推送**，所以每个 release 都能在 GitHub 上找到对应代码。`ALLOW_UNPUSHED=1` 可临时跳过，仅用于排障。
+- **测量版本变化要显式确认。** 新构建报告的 `measurementVersion` 与远端正在运行的不同时，`install` 默认拒绝。版本变化意味着读数口径变了，框架会把旧判决标 stale 并要求重测基线。确认后用 `ALLOW_VERSION_CHANGE=1 deploy/deploy.sh install`。
+- **重启后核对与冒烟**：远端 `/health` 的测量版本必须等于本机构建的版本；一条缺字段的 QL 必须得到 `verdict: null` 与 `errorCode: MISSING`。不通过就自动回滚到上一个 release，并在 `deploy.log` 记一条 `FAIL`。
+- **保留最近 5 个 release**（`KEEP_RELEASES`），`current` 与 `previous` 总会保留。
+- 重启期间服务中断约 1–2 秒，框架侧按 Retryable 重试。
+
+### 对外入口（首次部署，或改入口时）
+
+```bash
+deploy/deploy.sh proxy                                   # 证书（缺时生成，10 年）、nginx server 块、fail2ban；nginx -t 不过即撤回
+htpasswd -nB <账号> | deploy/deploy.sh proxy-user <账号>  # 新增或重置账号；只把 bcrypt 哈希推到服务器
+deploy/deploy.sh cert                                    # 取回证书到 ~/.config/harness/qlengine-ca.pem，供客户端钉住
+```
+
+- 入口端口由 `QLENGINE_PUBLIC_PORT` 指定，缺省 19999。
+- 只放行 `/health` `/functions` `/execute` `/execute/batch` `/compile` 五个路径，以及 GET / POST。请求体上限 16MB，限速 50 r/s（突发 200）。BasicAuth 连续失败 5 次封 IP 1 小时。
+- 同机进程可以直接访问 `127.0.0.1:7870`，不经 nginx。
+
+### 运行时
+
+- 不依赖系统 Java：从清华镜像下载 Temurin JRE 21 到 `/opt/qlengine/jre-*`，按 Adoptium 官方 sha256 校验。
+- JVM 参数为 `-Xmx128m`、SerialGC、C1，systemd `MemoryMax=256M`。实测一轮框架 `iterate`（300 次 batch）时 RSS 约 46MB。
+- `deploy/deploy.sh tunnel` 是 SSH 运维通道：本机 `127.0.0.1:17870` → 远端 `127.0.0.1:7870`，绕过 nginx。
 
 ## 已知限制
 
 - 没有鉴权与 TLS，只应监听本机或内网。
-- 三值路径只覆盖纯布尔表达式子集。超出子集的 QL 记为 `PARSE`，native 路径仍会求值。
+- 三值路径只覆盖表达式子集（含三元）。超出子集的 QL 记为 `PARSE`，native 路径仍会求值。
 - `isWeekendOrHoliday` 未接节假日表。
 - 三值路径数值用 double，与字段库声明的 BigDecimal 不一致（刻意保留，见上文）。
