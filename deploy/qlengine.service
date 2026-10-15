@@ -1,0 +1,27 @@
+[Unit]
+Description=qlengine QL 求值服务（RuleCraft 测量服务，仅监听 127.0.0.1:7870）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qlengine
+Group=qlengine
+WorkingDirectory=/opt/qlengine
+Environment=QLENGINE_HOST=127.0.0.1
+Environment=QLENGINE_PORT=7870
+# 参数与本机压测一致：10 张单全量度量，峰值 RSS 约 49MB
+ExecStart=/opt/qlengine/jre/bin/java -Xms32m -Xmx128m -Xss512k -XX:+UseSerialGC -XX:MaxMetaspaceSize=64m -XX:TieredStopAtLevel=1 -XX:+ExitOnOutOfMemoryError -jar /opt/qlengine/current/qlengine.jar
+Restart=on-failure
+RestartSec=5
+# 1.8G 的共用机器：给个上限，别把别人的服务挤死
+MemoryMax=256M
+StandardOutput=append:/var/log/qlengine.log
+StandardError=append:/var/log/qlengine.log
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
