@@ -241,7 +241,13 @@ systemctl reload nginx
 firewall-cmd -q --query-port=$port/tcp || { firewall-cmd -q --permanent --add-port=$port/tcp && firewall-cmd -q --reload; echo "firewalld 已放行 $port"; }
 touch /var/log/nginx/qlengine.error.log
 sed "s/__PORT__/$port/g" /tmp/qlengine-fail2ban.conf > /etc/fail2ban/jail.d/qlengine.conf
-fail2ban-client reload >/dev/null && fail2ban-client status qlengine-auth | sed -n '1p;$p'
+# 先校验整份 fail2ban 配置：机器上其他 jail 配错时全量 reload 会失败，那与本入口无关，只提示不硬改
+if fail2ban-client -t >/dev/null 2>&1; then
+  fail2ban-client reload >/dev/null && fail2ban-client status qlengine-auth | sed -n '1p;$p'
+else
+  echo "警告：fail2ban 现有配置校验不过（$(fail2ban-client -t 2>&1 | grep -m1 -o 'ERROR.*' || echo 未知)）。" >&2
+  echo "      qlengine-auth 已写入 /etc/fail2ban/jail.d/qlengine.conf，但未加载；修好那处配置后执行 fail2ban-client reload。" >&2
+fi
 rm -f /tmp/qlengine-nginx.conf /tmp/qlengine-fail2ban.conf /tmp/qlengine-nginx-t.log
 sleep 1
 echo "入口 :$port 就绪：未带凭证 → $(curl -sk -m 3 -o /dev/null -w '%{http_code}' https://127.0.0.1:$port/health)"
