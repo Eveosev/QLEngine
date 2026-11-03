@@ -7,7 +7,27 @@
 在 RuleCraft 自进化框架里，它还承担**测量服务**的角色：规则改进的好坏以它的读数为准。所以它会报告自己的测量版本和错误分类。
 
 - 运行时：Java 21（用到虚拟线程）。第三方依赖两个：`com.alibaba:qlexpress4:4.1.3`、`jackson-databind`。
-- 规模：Java 约 1950 行，测试 3 组，对拍工具 3 个（Python）。
+- 规模：Java 约 1950 行，测试 3 组（30 个用例），对拍工具 3 个（Python）。
+
+## 目录
+
+| 路径 | 内容 |
+|---|---|
+| `src/main/java/com/lingcai/qlengine/` | 服务源码（见「实现」） |
+| `src/test/java/com/lingcai/qlengine/` | `QlTest` / `FnTest` / `MeasureTest` |
+| `tools/` | 对拍与回放工具（Python） |
+| `deploy/` | 远端部署：`deploy.sh`、systemd 单元、nginx 与 fail2ban 模板 |
+| `run.sh` | 本机构建与启停 |
+| `probe-api.sh` | 用 `javap` 打印 QLExpress4 的真实 API 签名，升级 QLExpress 时先跑它 |
+
+## 分支
+
+| 分支 | 用途 |
+|---|---|
+| `main` | 默认分支，与 `integrate` 保持一致，线上 release 都能在这里找到 |
+| `integrate` | 日常集成分支，开发提交先进这里，验证后把 `main` 快进过来 |
+
+`deploy-remote`、`deploy-proxy`、`v4-measurement` 是已合入 `integrate` 的本地功能分支，不推到 GitHub。
 
 ## 与 QLExpress 的关系
 
@@ -166,7 +186,7 @@ QLENGINE_RULE_DIRS=<规则包目录>[:<规则包目录>…] QLENGINE_PAYLOADS=<�
 ### 发一个新版本
 
 ```bash
-git push origin integrate                 # install 只部署已推到 origin 的提交
+git push origin integrate                 # install 只部署已推到 origin 的提交（任一远端分支包含即可）
 deploy/deploy.sh install                  # 构建（含测试）→ 推 jar → 切换 → 重启 → 核对测量版本 → 冒烟 → 记日志
 deploy/deploy.sh releases                 # release 列表与部署日志
 deploy/deploy.sh rollback                 # 回到上一个；rollback <commit> 回到指定 release
@@ -198,9 +218,41 @@ deploy/deploy.sh cert                                    # 取回证书到 ~/.co
 - JVM 参数为 `-Xmx128m`、SerialGC、C1，systemd `MemoryMax=256M`。实测一轮框架 `iterate`（300 次 batch）时 RSS 约 46MB。
 - `deploy/deploy.sh tunnel` 是 SSH 运维通道：本机 `127.0.0.1:17870` → 远端 `127.0.0.1:7870`，绕过 nginx。
 
+### 部署现状
+
+截至 2026-11-03，线上只有一台，ssh 别名 `lingcai`（`deploy.sh` 的缺省 `QLENGINE_REMOTE`）。
+
+| 项 | 现状 |
+|---|---|
+| 主机 | `123.56.15.233`，Alibaba Cloud Linux 3，内存 1.8G，与 `lingcai-audit`、`lingcai-ocr`、`rulecraft` 等服务共用 |
+| 当前 release | `877315366b85`（提交 `8773153`），2026-10-15 部署，此后未重启；只有这一个 release，没有 `previous` |
+| 测量版本 | `qlexpress4-4.1.3+3vl#7318b8b3411f`，17 个函数 |
+| 服务 | systemd `qlengine.service`，用户 `qlengine`，`127.0.0.1:7870`；JRE `/opt/qlengine/jre-21.0.12.1_1` |
+| 对外入口 | `https://123.56.15.233:19999`（自签证书，SAN 为该 IP，2036-10-12 到期）+ BasicAuth |
+| fail2ban | **未生效**：`qlengine-auth` jail 文件已写入，但同机另一个 jail `nginx-auth` 找不到日志，`fail2ban-client -t` 失败，新 jail 没被加载。修好 `nginx-auth`（或把它停掉）后 `systemctl reload fail2ban` 即可 |
+
+已知的调用方：
+- RuleCraft 自进化框架（测量服务）；
+- AgentCPM 的 `ql-audit` 插件（报销单审核，经 19999 入口，CA 用 `deploy.sh cert` 取回的证书）。
+
+查看现状用 `deploy/deploy.sh status` 和 `deploy/deploy.sh releases`。每次发版、改入口或调用方变化后，同步更新本节。
+
 ## 已知限制
 
-- 没有鉴权与 TLS，只应监听本机或内网。
+- 服务本身没有鉴权与 TLS，只监听本机；对外一律经 nginx 入口（见「部署」）。
 - 三值路径只覆盖表达式子集（含三元）。超出子集的 QL 记为 `PARSE`，native 路径仍会求值。
 - `isWeekendOrHoliday` 未接节假日表。
 - 三值路径数值用 double，与字段库声明的 BigDecimal 不一致（刻意保留，见上文）。
+
+## 维护本文
+
+README 是本仓唯一的说明文档，以下改动要在同一个提交里同步更新：
+
+| 改了什么 | 更新哪一节 |
+|---|---|
+| `pom.xml` 的 QLExpress 版本、`Native.java` | 「与 QLExpress 的关系」 |
+| `Registry.java` / `Fn.java` 的函数、语义取舍 | 「实现」的白名单函数与语义取舍表 |
+| `Server.java` 路由、请求 / 返回字段、`errorCode` | 「接口」 |
+| `run.sh`、测试、`tools/` | 「构建与运行」 |
+| `deploy/` 下任何文件 | 「部署」 |
+| 发版、回滚、改入口、调用方变化 | 「部署现状」（写上日期） |
